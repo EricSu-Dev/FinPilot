@@ -48,70 +48,45 @@ def _format_sector_table(df: pd.DataFrame | None, top_n: int = 5, ascending: boo
 
 
 def _get_top_sectors() -> tuple[str, str | None]:
-    """获取涨幅前 5 的行业板块。返回 (格式化文本, 数据日期字符串或None)。"""
+    """获取涨幅前 5 的行业板块。返回 (格式化文本, 日期由 _get_market_fund_flow 统一提供)。"""
     df = _safe_akshare_call(ak.stock_board_industry_name_em)
     if df is None or df.empty:
         return "暂无数据", None
-    # 尝试从数据里提取日期（东方财富接口通常有"日期"列，或可以从其他列推断）
-    data_date = None
-    if "日期" in df.columns and not df.empty:
-        try:
-            data_date = str(df.iloc[0]["日期"])
-        except Exception:
-            pass
-    return _format_sector_table(df, 5, ascending=True), data_date
+    return _format_sector_table(df, 5, ascending=True), None
 
 
 def _get_bottom_sectors() -> tuple[str, str | None]:
-    """获取跌幅前 5 的行业板块。返回 (格式化文本, 数据日期字符串或None)。"""
+    """获取跌幅前 5 的行业板块。返回 (格式化文本, 日期由 _get_market_fund_flow 统一提供)。"""
     df = _safe_akshare_call(ak.stock_board_industry_name_em)
     if df is None or df.empty:
         return "暂无数据", None
-    data_date = None
-    if "日期" in df.columns and not df.empty:
-        try:
-            data_date = str(df.iloc[0]["日期"])
-        except Exception:
-            pass
-    return _format_sector_table(df, 5, ascending=False), data_date
+    return _format_sector_table(df, 5, ascending=False), None
 
 
 def _get_top_concepts() -> tuple[str, str | None]:
-    """获取涨幅前 5 的概念板块。返回 (格式化文本, 数据日期字符串或None)。"""
+    """获取涨幅前 5 的概念板块。返回 (格式化文本, 日期由 _get_market_fund_flow 统一提供)。"""
     df = _safe_akshare_call(ak.stock_board_concept_name_em)
     if df is None or df.empty:
         return "暂无数据", None
-    data_date = None
-    if "日期" in df.columns and not df.empty:
-        try:
-            data_date = str(df.iloc[0]["日期"])
-        except Exception:
-            pass
-    return _format_sector_table(df, 5), data_date
+    return _format_sector_table(df, 5), None
 
 
 def _get_zt_pool() -> tuple[str, str | None]:
-    """获取涨停池概况（数量 + 前 5 只涨停股）。返回 (格式化文本, 数据日期)。"""
+    """获取涨停池概况（数量 + 前 5 只涨停股）。返回 (格式化文本, 日期由 _get_market_fund_flow 统一提供)。"""
     today = datetime.now().strftime("%Y%m%d")
     df = _safe_akshare_call(ak.stock_zt_pool_em, date=today)
     if df is None or df.empty:
         return "暂无涨停股数据（可能为非交易时段）", None
-    # 尝试从数据里提取实际日期
-    data_date = None
-    if "日期" in df.columns and not df.empty:
-        try:
-            data_date = str(df.iloc[0]["日期"])
-        except Exception:
-            pass
     count = len(df)
     top5 = df.head(5)
     lines = [f"涨停股共 {count} 只，前 5 只："]
     for _, row in top5.iterrows():
         code = row.get("代码", "")
         name = row.get("名称", "")
-        reason = row.get("涨停原因", "")
-        lines.append(f"- {name}({code})：{reason}")
-    return "\n".join(lines), data_date
+        industry = row.get("所属行业", "")
+        zt_stat = row.get("涨停统计", "")
+        lines.append(f"- {name}({code})：{industry} | 涨停统计 {zt_stat}")
+    return "\n".join(lines), None
 
 
 def _get_market_fund_flow() -> tuple[str, str | None]:
@@ -120,7 +95,7 @@ def _get_market_fund_flow() -> tuple[str, str | None]:
     if df is None or df.empty:
         return "暂无大盘资金流向数据", None
     try:
-        latest = df.iloc[0]
+        latest = df.iloc[-1]  # 数据按日期升序排列，取最后一条即最新交易日
         date = latest.get("日期", None)
         data_date = str(date) if date else None
         main_net = latest.get("主力净流入-净额", 0)
@@ -138,7 +113,7 @@ def _get_market_fund_flow() -> tuple[str, str | None]:
 
 
 def _get_major_indices() -> tuple[str, str | None]:
-    """获取主要大盘指数实时行情。返回 (格式化文本, 数据日期)。
+    """获取主要大盘指数实时行情。返回 (格式化文本, 日期由 _get_market_fund_flow 统一提供)。
 
     包括：上证指数、深证成指、创业板指、科创50、北证50、沪深300、中证500。
     """
@@ -151,7 +126,7 @@ def _get_major_indices() -> tuple[str, str | None]:
         "000001": "上证指数",
         "399001": "深证成指",
         "399006": "创业板指",
-        "000688": "科创50",  # 科创50 实际代码可能是 000688.SH，akshare 可能用不同格式
+        "000688": "科创50",
         "899050": "北证50",
         "000300": "沪深300",
         "000905": "中证500",
@@ -159,7 +134,6 @@ def _get_major_indices() -> tuple[str, str | None]:
 
     # 尝试匹配指数
     lines = []
-    data_date = None
 
     for _, row in df.iterrows():
         code = str(row.get("代码", ""))
@@ -179,14 +153,7 @@ def _get_major_indices() -> tuple[str, str | None]:
             except Exception:
                 lines.append(f"- {matched_name}：数据解析失败")
 
-    # 尝试提取日期
-    if "日期" in df.columns and not df.empty:
-        try:
-            data_date = str(df.iloc[0]["日期"])
-        except Exception:
-            pass
-
-    return "\n".join(lines) if lines else "未找到主要指数数据", data_date
+    return "\n".join(lines) if lines else "未找到主要指数数据", None
 
 
 @tool
@@ -200,15 +167,12 @@ def market_hotspots_tool() -> str:
     注意：非交易时段（周末、节假日、收盘后）调用时，akshare 返回的是上一个
     交易日的数据。工具会明确标注数据实际日期，请在回答中如实告知用户。
     """
-    indices, indices_date = _get_major_indices()
-    sectors, sectors_date = _get_top_sectors()
-    bottom_sectors, bottom_date = _get_bottom_sectors()
-    concepts, concepts_date = _get_top_concepts()
-    zt_pool, zt_date = _get_zt_pool()
-    fund_flow, flow_date = _get_market_fund_flow()
-
-    # 取第一个有日期的作为数据日期，都没有则标注"最新"
-    data_date = indices_date or sectors_date or concepts_date or zt_date or flow_date
+    indices, _ = _get_major_indices()
+    sectors, _ = _get_top_sectors()
+    bottom_sectors, _ = _get_bottom_sectors()
+    concepts, _ = _get_top_concepts()
+    zt_pool, _ = _get_zt_pool()
+    fund_flow, data_date = _get_market_fund_flow()
     if data_date:
         date_note = f"（数据日期：{data_date}，非交易时段返回的是上一个交易日数据）"
     else:
