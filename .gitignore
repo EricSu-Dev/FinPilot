@@ -1,0 +1,23 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Chroma
+chroma_db/
+*.sqlite3
+
+# 上传的财报 PDF（用户数据，不入库）
+data/uploads/
+
+.claude
+
+md/
