@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import queue as sync_queue
+import threading
 from typing import Any, Literal
 
 from fastapi import APIRouter
@@ -45,17 +47,52 @@ async def validate_diagnosis_code(code: str, type: str):
 
 
 def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
-    """在每个诊断节点完成时产出对应的 SSE 事件。"""
+    """在每个诊断节点完成时产出对应的 SSE 事件。
+
+    和对话首页一样的问题：基金诊断的 fetch_data_node 同步阻塞 15~50s
+    （akshare 多次串行调用），期间 graph.stream() 不产出任何输出，
+    前端/Nginx 静默超时。
+
+    解决：graph.stream() 跑在独立线程里，通过线程安全队列传递 chunk；主线程
+    每 5s 轮询队列，空超则发心跳 SSE 保活。
+    """
     graph = build_diagnosis_graph(debug=False)
     initial_state = {"target_code": code, "target_type": target_type, "messages": []}
 
+    q: sync_queue.Queue[tuple[str, Any]] = sync_queue.Queue()
+
+    def _run_graph():
+        try:
+            for chunk in graph.stream(initial_state, stream_mode="updates"):
+                q.put(("chunk", chunk))
+            q.put(("done", None))
+        except Exception as exc:
+            q.put(("error", exc))
+
+    t = threading.Thread(target=_run_graph, daemon=True)
+    t.start()
+
     try:
-        for chunk in graph.stream(initial_state, stream_mode="updates"):
+        while True:
+            try:
+                msg_type, payload = q.get(timeout=5.0)
+            except sync_queue.Empty:
+                yield sse_event("heartbeat", {"status": "processing"})
+                continue
+
+            if msg_type == "done":
+                break
+
+            if msg_type == "error":
+                yield sse_event("error", {"node": "stream", "message": str(payload)})
+                return
+
+            # msg_type == "chunk"
+            chunk = payload
             if not isinstance(chunk, dict):
                 continue
 
             for node_name, node_update in chunk.items():
-                # 检查节点是否返回了错误
                 node_error = node_update.get("error") if isinstance(node_update, dict) else None
 
                 yield sse_event("node_complete", {
@@ -63,7 +100,6 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
                     "status": "error" if node_error else "done",
                 })
 
-                # 如果节点失败，立刻发送 error 事件并终止
                 if node_error:
                     yield sse_event("error", {
                         "node": node_name,
@@ -80,14 +116,14 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
                         })
                         return
                     if hasattr(analysis_result, "model_dump"):
-                        payload = analysis_result.model_dump()
+                        payload_out = analysis_result.model_dump()
                     elif isinstance(analysis_result, dict):
-                        payload = analysis_result
+                        payload_out = analysis_result
                     else:
-                        payload = json.loads(json.dumps(analysis_result, default=str))
-                    yield sse_event("analysis_result", payload)
-    except Exception as exc:
-        yield sse_event("error", {"node": "stream", "message": str(exc)})
+                        payload_out = json.loads(json.dumps(analysis_result, default=str))
+                    yield sse_event("analysis_result", payload_out)
+    finally:
+        t.join(timeout=2.0)
 
 
 @router.post("")

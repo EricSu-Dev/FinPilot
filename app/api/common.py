@@ -22,6 +22,6 @@ def api_error(message: str, status_code: int = 500) -> JSONResponse:
 
 
 def sse_event(event: str, data: Any) -> str:
-    """格式化一条 server-sent event 载荷。"""
+    """把数据包成标准 SSE 格式的字符串"""
     payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
     return f"event: {event}\ndata: {payload}\n\n"

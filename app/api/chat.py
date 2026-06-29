@@ -65,46 +65,44 @@ class ChatRequest(BaseModel):
     )
 
 
-async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int]):
-    """生成 SSE 事件流：start → (token|tool_start|tool_end)* → done/error。"""
+async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int]):   #Optional[int]:如果是None也合法
+    #获取会话
     cid, conv = chat_memory.get_or_create(user_id, conversation_id)
     yield sse_event("start", {"conversation_id": cid})
 
-    # 先把用户发言写进会话历史，agent 调用时即带上完整多轮上下文。
+    # 先把用户发言写进 mysql，agent 调用时即带上完整多轮上下文
     chat_memory.append_messages(cid, [HumanMessage(content=message)])
 
-    # 首条消息：用其内容片段作为会话标题，方便侧边栏区分。
-    if not conv.messages:
-        chat_crud.rename_conversation(user_id, cid, message[:_TITLE_LIMIT])
+    # 首条消息：用其内容片段作为会话标题
+    if not conv.messages:    # if not conv.messages-> if not [] -> if not false -> if true
+        chat_crud.rename_conversation(user_id, cid, message[:_TITLE_LIMIT])  # message[:30]: 从开头取到下标 30（不含30）
 
     try:
         agent = build_chat_agent(user_id, cid)
-        full_text = ""
-        pending_tool: Optional[str] = None  # 已发 tool_start 但还没收到 ToolMessage 的工具名
+        full_text = ""  #用于累积 agent 流式输出的完整文本，后面会逐块拼接
+        # 已发 tool_start 但还没收到 ToolMessage 的工具名
+        pending_tool: Optional[str] = None  # : Optional[str]: 类型注解 — 这个变量可能是字符串，也可能是 None
 
-        # conv.messages 是 DB 载入的历史；本轮用户消息已落库但不在该列表里，
-        # 这里手动拼上，让 agent 拿到 完整历史 + 本轮发言。
+        # 将包含全部对话历史 + 本轮发言的完整列表，传给 agent
+        # *conv.messages: 把 conv.messages 列表里的所有元素摊开，放入新列表
         agent_messages = [*conv.messages, HumanMessage(content=message)]
 
-        # 关键设计：LangGraph 的 ToolNode 调用同步工具函数（baostock / akshare
-        # 均为同步 I/O）时直接阻塞当前线程。若在主 asyncio 线程里跑 agent.astream()，
-        # 工具执行期间事件循环被卡住，任何 asyncio task（包括心跳）都无法调度。
-        #
-        # 解决方案：把 agent.astream() 扔到独立线程里跑（自带 event loop），主线程
-        # 通过线程安全的 queue.Queue 收 chunk，同时用 run_in_executor 做 5s 超时轮询
-        # ——队列空超 5s 即发心跳 SSE，确保前端 / Nginx 在工具执行期间不会静默超时。
+        # 关键设计：LangGraph 的 ToolNode 调用同步工具函数（baostock / akshare)时直接阻塞当前线程
+        # 若在主 asyncio 线程里跑 agent.astream()，工具执行期间事件循环被卡住，任何 asyncio task（包括心跳）都无法调度
+        # 解决方案：把 agent.astream() 扔到独立线程里跑（自带 event loop），主线程通过线程安全的 queue.Queue 收 chunk
+        # 同时用 run_in_executor 做 5s 超时轮询队列空超 5s 即发心跳 SSE，确保前端 / Nginx 在工具执行期间不会静默超时
         import queue as sync_queue
 
         chunk_q: sync_queue.Queue[tuple[str, Any]] = sync_queue.Queue()
 
+        #事件循环: 一个不断转圈的调度器，负责"哪个任务准备好了就去执行它"，让程序在等待 I/O 时不浪费 CPU
+        #生产者（子线程）
         def _run_agent_in_thread():
-            """在独立线程里跑 agent.astream()，产出推入线程安全队列。"""
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            loop = asyncio.new_event_loop() # 创建一个全新的、独立的事件循环
+            asyncio.set_event_loop(loop)  #把刚创建的事件循环设为"当前线程的默认事件循环
             try:
                 async def _stream():
-                    # recursion_limit=18 → 最多约 8 轮工具调用（每轮约 2 superstep:
-                    # agent 节点 + tools 节点），用作显式熔断以防止 agent 陷入循环。
+                    # recursion_limit=18 → 最多约 8 轮工具调用(2*8+1+1=18)，用作显式熔断以防止 agent 陷入循环
                     async for chunk, meta in agent.astream(
                         {"messages": agent_messages},
                         stream_mode="messages",
@@ -119,15 +117,15 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
                 loop.close()
 
         agent_thread = threading.Thread(target=_run_agent_in_thread, daemon=True)
-        agent_thread.start()
+        agent_thread.start() #启动子线程
 
         try:
             while True:
-                # 用 run_in_executor 做带超时的队列轮询：不阻塞主事件循环，
-                # 超时 5s 无消息则发心跳 SSE。
+                # 线程池做带超时的队列轮询, 不阻塞主事件循环
+                # 超时 5s 无消息则发心跳 SSE
                 try:
                     msg_type, payload = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: chunk_q.get(timeout=5.0)
+                        None, lambda: chunk_q.get(timeout=5.0)  # 线程池（None = 默认线程池）
                     )
                 except sync_queue.Empty:
                     # 5 秒内 agent 线程没产出任何 chunk → 工具执行中，发心跳保活
@@ -138,12 +136,11 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
                     break
 
                 if msg_type == "agent_error":
-                    raise payload  # type: ignore[misc]
+                    raise payload
 
-                # msg_type == "chunk"
                 chunk, meta = payload
 
-                # ToolMessage = 工具执行完毕，发 tool_end（带可靠工具名 + 简短摘要）。
+                # ToolMessage = 工具执行完毕，发 tool_end（带可靠工具名 + 简短摘要）
                 if isinstance(chunk, ToolMessage):
                     tool_name = getattr(chunk, "name", None) or pending_tool or "工具"
                     tool_name_zh = _TOOL_NAME_ZH.get(tool_name, tool_name)
