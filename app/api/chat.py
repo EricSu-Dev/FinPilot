@@ -103,8 +103,12 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
             asyncio.set_event_loop(loop)
             try:
                 async def _stream():
+                    # recursion_limit=18 → 最多约 8 轮工具调用（每轮约 2 superstep:
+                    # agent 节点 + tools 节点），用作显式熔断以防止 agent 陷入循环。
                     async for chunk, meta in agent.astream(
-                        {"messages": agent_messages}, stream_mode="messages"
+                        {"messages": agent_messages},
+                        stream_mode="messages",
+                        config={"recursion_limit": 18},
                     ):
                         chunk_q.put(("chunk", (chunk, meta)))
                     chunk_q.put(("agent_done", None))
