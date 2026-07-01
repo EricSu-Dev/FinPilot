@@ -36,8 +36,16 @@ def get_current_user(
     user_id = payload.get("sub")
     if user_id is None:
         raise HTTPException(status_code=401, detail="token 缺少用户标识")
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="token 用户标识无效",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    user = db.get(User, int(user_id))
+    user = db.get(User, user_id_int)
     if user is None:
         raise HTTPException(status_code=401, detail="用户不存在")
     return user

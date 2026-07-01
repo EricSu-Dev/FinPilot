@@ -4,10 +4,17 @@
 `app.main` 中定义的 FastAPI 应用，使 `uvicorn main:app` 与
 `uvicorn app.main:app` 行为一致。
 """
-#把 app/main.py 里面的变量 app 导入过来
-__import__("pysqlite3")
-import sys
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+# 把 app/main.py 里面的变量 app 导入过来。
+# 某些 Chroma 部署环境需要较新的 sqlite，可安装 pysqlite3 后自动替换；
+# 本地未安装时继续使用标准库 sqlite3，避免 `python main.py` 直接启动失败。
+try:
+    __import__("pysqlite3")
+except ModuleNotFoundError:
+    pass
+else:
+    import sys
+
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
 from app.main import app
 
@@ -21,4 +28,3 @@ if __name__ == "__main__":
     #host="0.0.0.0" 允许所有机器访问
     #reload=True 热更新,代码改了自动重启
     uvicorn.run("app.main:app", host="0.0.0.0", port=8094, reload=False)
-

@@ -28,8 +28,8 @@ class PortfolioCreateRequest(BaseModel):
     code: str
     name: str
     type: Literal["stock", "fund"]
-    shares: Decimal
-    cost_price: Decimal
+    shares: Decimal = Field(gt=0)
+    cost_price: Decimal = Field(gt=0)
 
     @field_validator("code")
     @classmethod
@@ -44,8 +44,8 @@ class PortfolioCreateRequest(BaseModel):
 class PortfolioUpdateRequest(BaseModel):
     """用于更新一行持仓的载荷。"""
 
-    shares: Decimal
-    cost_price: Decimal
+    shares: Decimal = Field(gt=0)
+    cost_price: Decimal = Field(gt=0)
 
 
 def _serialize_decimal(value: Any) -> Any:
@@ -171,5 +171,4 @@ async def remove_portfolio_item(
         return api_ok({"deleted": deleted})
     except Exception as exc:
         return api_error(str(exc))
-
 
