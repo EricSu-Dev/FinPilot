@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue as sync_queue
 import threading
+import time
 from typing import Any, Literal
 
 from fastapi import APIRouter
@@ -15,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from app.agents.diagnosis_agent import build_diagnosis_graph
 from app.api.common import api_error, api_ok, sse_event
 from app.data_source.code_validation import verify_security_code
+from app.observability import elapsed_ms, log_agent_event, new_trace_id
 
 router = APIRouter(prefix="/diagnosis", tags=["diagnosis"])
 
@@ -56,8 +59,23 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
     解决：graph.stream() 跑在独立线程里，通过线程安全队列传递 chunk；主线程
     每 5s 轮询队列，空超则发心跳 SSE 保活。
     """
+    trace_id = new_trace_id("diagnosis")
+    request_started_at = time.perf_counter()
+    last_node_finished_at = request_started_at
+    heartbeat_count = 0
+    log_agent_event(
+        "diagnosis.request.start",
+        trace_id=trace_id,
+        target_code=code,
+        target_type=target_type,
+    )
     graph = build_diagnosis_graph(debug=False)
-    initial_state = {"target_code": code, "target_type": target_type, "messages": []}
+    initial_state = {
+        "target_code": code,
+        "target_type": target_type,
+        "messages": [],
+        "observability_trace_id": trace_id,
+    }
 
     q: sync_queue.Queue[tuple[str, Any]] = sync_queue.Queue()
 
@@ -77,13 +95,39 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
             try:
                 msg_type, payload = q.get(timeout=5.0)
             except sync_queue.Empty:
+                heartbeat_count += 1
+                log_agent_event(
+                    "diagnosis.heartbeat",
+                    level=logging.DEBUG,
+                    trace_id=trace_id,
+                    target_code=code,
+                    target_type=target_type,
+                    count=heartbeat_count,
+                )
                 yield sse_event("heartbeat", {"status": "processing"})
                 continue
 
             if msg_type == "done":
+                log_agent_event(
+                    "diagnosis.request.done",
+                    trace_id=trace_id,
+                    target_code=code,
+                    target_type=target_type,
+                    duration_ms=elapsed_ms(request_started_at),
+                    heartbeats=heartbeat_count,
+                )
                 break
 
             if msg_type == "error":
+                log_agent_event(
+                    "diagnosis.request.error",
+                    level=logging.ERROR,
+                    trace_id=trace_id,
+                    target_code=code,
+                    target_type=target_type,
+                    duration_ms=elapsed_ms(request_started_at),
+                    error=str(payload),
+                )
                 yield sse_event("error", {"node": "stream", "message": str(payload)})
                 return
 
@@ -94,6 +138,19 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
 
             for node_name, node_update in chunk.items():
                 node_error = node_update.get("error") if isinstance(node_update, dict) else None
+                now = time.perf_counter()
+                node_duration_ms = int((now - last_node_finished_at) * 1000)
+                last_node_finished_at = now
+                log_agent_event(
+                    "diagnosis.node.done",
+                    trace_id=trace_id,
+                    target_code=code,
+                    target_type=target_type,
+                    node=node_name,
+                    status="error" if node_error else "done",
+                    duration_ms=node_duration_ms,
+                    total_duration_ms=elapsed_ms(request_started_at),
+                )
 
                 yield sse_event("node_complete", {
                     "node": node_name,
@@ -101,6 +158,15 @@ def _diagnosis_stream_payload(code: str, target_type: Literal["stock", "fund"]):
                 })
 
                 if node_error:
+                    log_agent_event(
+                        "diagnosis.node.error",
+                        level=logging.ERROR,
+                        trace_id=trace_id,
+                        target_code=code,
+                        target_type=target_type,
+                        node=node_name,
+                        error=str(node_error),
+                    )
                     yield sse_event("error", {
                         "node": node_name,
                         "message": f"节点 [{node_name}] 执行失败: {node_error}",

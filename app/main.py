@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import auth, chat, diagnosis, portfolio
 from app.api.rag import ingest_uploaded_report  # noqa: F401 - 保留共享入库逻辑供 chat 复用（rag 路由已下线）
 from app.api.common import api_error
+from app.health import run_deep_health_check
 from app.models.chat import ChatConversation, ChatMessage  # noqa: F401 - 导入以使 metadata 包含 chat 表
 from app.models.database import Base, engine
 from app.models.user import User  # noqa: F401 - 导入以使 metadata 包含 users 表
@@ -88,6 +89,26 @@ async def generic_exception_handler(request: Request, exc: Exception):
 async def health_check():
     """供部署探针使用的简单健康检查端点。"""
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"status": "healthy"}})
+
+
+@app.get("/health/deep")
+async def deep_health_check(
+    external: bool = Query(
+        default=False,
+        description="Also check TCP connectivity to external providers without calling paid APIs.",
+    )
+):
+    """Run deeper checks for deployment diagnostics."""
+    result = run_deep_health_check(external=external)
+    status_code = 503 if result["status"] == "unhealthy" else 200
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": 0 if status_code == 200 else 503,
+            "msg": result["status"],
+            "data": result,
+        },
+    )
 
 
 if __name__ == "__main__":

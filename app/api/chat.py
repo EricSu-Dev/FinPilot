@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -27,6 +28,7 @@ from app.agents import chat_memory
 from app.agents.chat_agent import build_chat_agent
 from app.models import chat_crud
 from app.models.user import User
+from app.observability import elapsed_ms, log_agent_event, new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,18 @@ class ChatRequest(BaseModel):
 
 async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int]):   #Optional[int]:如果是None也合法
     #获取会话
+    trace_id = new_trace_id("chat")
+    request_started_at = time.perf_counter()
     cid, conv = chat_memory.get_or_create(user_id, conversation_id)
+    log_agent_event(
+        "chat.request.start",
+        trace_id=trace_id,
+        user_id=user_id,
+        conversation_id=cid,
+        incoming_conversation_id=conversation_id,
+        message_len=len(message),
+        history_messages=len(conv.messages),
+    )
     yield sse_event("start", {"conversation_id": cid})
 
     # 先把用户发言写进 mysql，agent 调用时即带上完整多轮上下文
@@ -85,6 +98,10 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
 
         # 将包含全部对话历史 + 本轮发言的完整列表，传给 agent
         # *conv.messages: 把 conv.messages 列表里的所有元素摊开，放入新列表
+        pending_tool_started_at: Optional[float] = None
+        token_chunks = 0
+        heartbeat_count = 0
+        tool_calls = 0
         agent_messages = [*conv.messages, HumanMessage(content=message)]
 
         # 关键设计：LangGraph 的 ToolNode 调用同步工具函数（baostock / akshare)时直接阻塞当前线程
@@ -130,12 +147,37 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
                 except sync_queue.Empty:
                     # 5 秒内 agent 线程没产出任何 chunk → 工具执行中，发心跳保活
                     yield sse_event("heartbeat", {"status": "processing"})
+                    heartbeat_count += 1
+                    log_agent_event(
+                        "chat.heartbeat",
+                        level=logging.DEBUG,
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        conversation_id=cid,
+                        count=heartbeat_count,
+                    )
                     continue
 
                 if msg_type == "agent_done":
+                    log_agent_event(
+                        "chat.agent.done",
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        conversation_id=cid,
+                        duration_ms=elapsed_ms(request_started_at),
+                    )
                     break
 
                 if msg_type == "agent_error":
+                    log_agent_event(
+                        "chat.agent.error",
+                        level=logging.ERROR,
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        conversation_id=cid,
+                        duration_ms=elapsed_ms(request_started_at),
+                        error=str(payload),
+                    )
                     raise payload
 
                 chunk, meta = payload
@@ -146,11 +188,22 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
                     tool_name_zh = _TOOL_NAME_ZH.get(tool_name, tool_name)
                     content = chunk.content
                     summary = content if isinstance(content, str) else str(content)
+                    log_agent_event(
+                        "chat.tool.end",
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        conversation_id=cid,
+                        tool=tool_name,
+                        tool_display=tool_name_zh,
+                        duration_ms=elapsed_ms(pending_tool_started_at) if pending_tool_started_at else None,
+                        result_len=len(summary),
+                    )
                     yield sse_event(
                         "tool_end",
                         {"tool": tool_name_zh, "summary": summary[:_TOOL_SUMMARY_LIMIT]},
                     )
                     pending_tool = None
+                    pending_tool_started_at = None
                     continue
 
                 # AIMessageChunk：可能是文本 token，也可能是工具调用参数分片。
@@ -168,13 +221,25 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
                                 name = tcc["name"]
                                 break
                         pending_tool = name or "工具"
+                        pending_tool_started_at = time.perf_counter()
+                        tool_calls += 1
                         pending_tool_zh = _TOOL_NAME_ZH.get(pending_tool, pending_tool)
+                        log_agent_event(
+                            "chat.tool.start",
+                            trace_id=trace_id,
+                            user_id=user_id,
+                            conversation_id=cid,
+                            tool=pending_tool,
+                            tool_display=pending_tool_zh,
+                            tool_call_index=tool_calls,
+                        )
                         yield sse_event("tool_start", {"tool": pending_tool_zh})
                     # 工具参数分片不作为 token 下发给前端。
                     continue
 
                 if isinstance(content, str) and content:
                     full_text += content
+                    token_chunks += 1
                     yield sse_event("token", {"content": content})
         finally:
             # agent_thread 是 daemon，进程退出时会自动清理；但还是 join 一下
@@ -187,14 +252,50 @@ async def _chat_stream(user_id: int, message: str, conversation_id: Optional[int
         if full_text:
             try:
                 chat_memory.append_messages(cid, [AIMessage(content=full_text)])
+                log_agent_event(
+                    "chat.persist.success",
+                    trace_id=trace_id,
+                    user_id=user_id,
+                    conversation_id=cid,
+                    response_len=len(full_text),
+                    response_chunks=token_chunks,
+                )
             except Exception:  # noqa: BLE001
+                log_agent_event(
+                    "chat.persist.error",
+                    level=logging.ERROR,
+                    trace_id=trace_id,
+                    user_id=user_id,
+                    conversation_id=cid,
+                    response_len=len(full_text),
+                )
                 logger.exception(
                     "保存 assistant 消息失败 cid=%s（用户已收到回答，不影响本次；"
                     "该轮回答不会进入历史，下一轮 agent 看不到它）", cid
                 )
+        log_agent_event(
+            "chat.request.done",
+            trace_id=trace_id,
+            user_id=user_id,
+            conversation_id=cid,
+            duration_ms=elapsed_ms(request_started_at),
+            response_len=len(full_text),
+            response_chunks=token_chunks,
+            tool_calls=tool_calls,
+            heartbeats=heartbeat_count,
+        )
         yield sse_event("done", {"conversation_id": cid})
     except Exception as exc:  # noqa: BLE001  流式过程中的异常转成 error 事件
         logger.exception("chat 流式失败 user_id=%s cid=%s", user_id, cid)
+        log_agent_event(
+            "chat.request.error",
+            level=logging.ERROR,
+            trace_id=trace_id,
+            user_id=user_id,
+            conversation_id=cid,
+            duration_ms=elapsed_ms(request_started_at),
+            error=str(exc),
+        )
         yield sse_event("error", {"message": str(exc)})
 
 

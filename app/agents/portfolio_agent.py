@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean
@@ -22,6 +24,9 @@ from app.agents.diagnosis_agent import (
     FundDiagnosisResult,
     build_diagnosis_graph,
 )
+from app.observability import elapsed_ms, log_agent_event, new_trace_id
+
+logger = logging.getLogger(__name__)
 
 
 class PortfolioHoldingInput(TypedDict, total=False):
@@ -62,6 +67,7 @@ class PortfolioState(TypedDict, total=False):
     holding_reports: list[dict[str, Any]]
     report: Optional[PortfolioReport]
     error: Optional[str]
+    observability_trace_id: str
     messages: Annotated[list[BaseMessage], append_messages]
 
 
@@ -134,7 +140,7 @@ def build_portfolio_graph(debug: bool = False):
     diagnosis_graph = build_diagnosis_graph(debug=debug)
     workflow: StateGraph[PortfolioState] = StateGraph(PortfolioState)
 
-    def diagnose_one(holding: PortfolioHoldingInput) -> dict[str, Any]:
+    def diagnose_one(holding: PortfolioHoldingInput, trace_id: str, holding_index: int) -> dict[str, Any]:
         """对单条持仓跑一次诊断图，返回 holding_report dict。
 
         抽出来是为了能并发：每条持仓的诊断彼此独立（各自抓数据 + 各自调 LLM），
@@ -143,7 +149,24 @@ def build_portfolio_graph(debug: bool = False):
         """
         code = holding.get("code", "").strip()
         holding_type = holding.get("type", "stock")
+        holding_started_at = time.perf_counter()
+        log_agent_event(
+            "portfolio.holding.start",
+            trace_id=trace_id,
+            holding_index=holding_index,
+            code=code,
+            holding_type=holding_type,
+        )
         if not code:
+            log_agent_event(
+                "portfolio.holding.error",
+                level=logging.WARNING,
+                trace_id=trace_id,
+                holding_index=holding_index,
+                holding_type=holding_type,
+                duration_ms=elapsed_ms(holding_started_at),
+                error="empty code",
+            )
             return {
                 "code": "",
                 "name": holding.get("name", ""),
@@ -152,15 +175,46 @@ def build_portfolio_graph(debug: bool = False):
                 "risk_level": "高",
             }
 
-        diagnosis_state = diagnosis_graph.invoke(
-            {
-                "target_code": code,
-                "target_type": holding_type,
-                "messages": [],
+        try:
+            diagnosis_state = diagnosis_graph.invoke(
+                {
+                    "target_code": code,
+                    "target_type": holding_type,
+                    "messages": [],
+                    "observability_trace_id": trace_id,
+                }
+            )
+        except Exception as exc:
+            log_agent_event(
+                "portfolio.holding.error",
+                level=logging.ERROR,
+                trace_id=trace_id,
+                holding_index=holding_index,
+                code=code,
+                holding_type=holding_type,
+                duration_ms=elapsed_ms(holding_started_at),
+                error=str(exc),
+            )
+            logger.exception("portfolio holding diagnosis failed code=%s type=%s", code, holding_type)
+            return {
+                "code": code,
+                "name": holding.get("name", ""),
+                "type": holding_type,
+                "summary": f"诊断失败：{exc}",
+                "risk_level": "高",
             }
-        )
         diagnosis_result = diagnosis_state.get("analysis_result")
         if diagnosis_state.get("error") or diagnosis_result is None:
+            log_agent_event(
+                "portfolio.holding.error",
+                level=logging.WARNING,
+                trace_id=trace_id,
+                holding_index=holding_index,
+                code=code,
+                holding_type=holding_type,
+                duration_ms=elapsed_ms(holding_started_at),
+                error=str(diagnosis_state.get("error", "missing analysis_result")),
+            )
             return {
                 "code": code,
                 "name": holding.get("name", ""),
@@ -175,6 +229,15 @@ def build_portfolio_graph(debug: bool = False):
             summary_text = diagnosis_result.core_diagnosis
         else:
             summary_text = diagnosis_result.one_sentence_summary
+        log_agent_event(
+            "portfolio.holding.done",
+            trace_id=trace_id,
+            holding_index=holding_index,
+            code=code,
+            holding_type=holding_type,
+            duration_ms=elapsed_ms(holding_started_at),
+            risk_level=diagnosis_result.risk_level,
+        )
         return {
             "code": code,
             "name": holding.get("name", code),
@@ -187,19 +250,61 @@ def build_portfolio_graph(debug: bool = False):
         # 该节点在多个持仓上展开，并复用诊断图，使每个持仓都走相同的推理流水线。
         # 各持仓诊断相互独立，用线程池并发跑，把 N 条持仓的墙钟时间从累加降到≈最慢一条。
         holdings = state.get("holdings", [])
+        trace_id = state.get("observability_trace_id") or new_trace_id("portfolio")
+        node_started_at = time.perf_counter()
         if not holdings:
-            return {"holding_reports": [], "error": None}
+            log_agent_event(
+                "portfolio.holdings.done",
+                trace_id=trace_id,
+                holdings_count=0,
+                duration_ms=elapsed_ms(node_started_at),
+            )
+            return {"holding_reports": [], "error": None, "observability_trace_id": trace_id}
 
         # 单条持仓诊断涉及数据抓取（akshare/baostock/ddgs）与 LLM 调用，都是 IO 密集，
         # 线程并发合适。worker 数封顶 5，避免持仓很多时一次性打出太多并发请求把
         # 数据源或 DeepSeek 限流打爆（DeepSeek/akshare 都有 QPS 限制）。
         max_workers = min(len(holdings), 5)
+        log_agent_event(
+            "portfolio.holdings.start",
+            trace_id=trace_id,
+            holdings_count=len(holdings),
+            max_workers=max_workers,
+        )
         ordered: list[dict[str, Any]] = [None] * len(holdings)  # type: ignore[list-item]
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_idx = {pool.submit(diagnose_one, h): i for i, h in enumerate(holdings)}
+            future_to_idx = {
+                pool.submit(diagnose_one, h, trace_id, i): i for i, h in enumerate(holdings)
+            }
             for future in as_completed(future_to_idx):
-                ordered[future_to_idx[future]] = future.result()
-        return {"holding_reports": ordered, "error": None}
+                idx = future_to_idx[future]
+                try:
+                    ordered[idx] = future.result()
+                except Exception as exc:
+                    holding = holdings[idx]
+                    log_agent_event(
+                        "portfolio.holding.future_error",
+                        level=logging.ERROR,
+                        trace_id=trace_id,
+                        holding_index=idx,
+                        code=holding.get("code"),
+                        holding_type=holding.get("type"),
+                        error=str(exc),
+                    )
+                    ordered[idx] = {
+                        "code": holding.get("code", ""),
+                        "name": holding.get("name", ""),
+                        "type": holding.get("type", "stock"),
+                        "summary": f"诊断失败：{exc}",
+                        "risk_level": "高",
+                    }
+        log_agent_event(
+            "portfolio.holdings.done",
+            trace_id=trace_id,
+            holdings_count=len(holdings),
+            duration_ms=elapsed_ms(node_started_at),
+        )
+        return {"holding_reports": ordered, "error": None, "observability_trace_id": trace_id}
 
     def summarize_portfolio_node(state: PortfolioState) -> dict[str, Any]:
         # 该节点把各持仓的诊断结果折叠为紧凑的组合视图，无需再次调用模型。
@@ -229,6 +334,12 @@ def build_portfolio_graph(debug: bool = False):
             risk_level=risk_level,
             holdings=holding_models,
             disclaimer=DEFAULT_DISCLAIMER,
+        )
+        log_agent_event(
+            "portfolio.summary.done",
+            trace_id=state.get("observability_trace_id"),
+            holdings_count=len(holding_models),
+            risk_level=risk_level,
         )
         return {"report": report}
 

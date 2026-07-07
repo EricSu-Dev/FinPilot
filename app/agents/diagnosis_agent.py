@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pprint import pformat
 from typing import Annotated, Any, Literal, Optional, TypedDict, Union
 
@@ -31,6 +32,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from app.llm import llm
+from app.observability import elapsed_ms, log_agent_event, new_trace_id, payload_size
 from app.tools.fund_tools import (
     fund_fee_tool,
     fund_industry_allocation_tool,
@@ -166,6 +168,7 @@ class DiagnosisState(TypedDict, total=False):
     analysis_result: Optional[Union[DiagnosisResult, FundDiagnosisResult]]
     messages: Annotated[list[BaseMessage], _append_messages]
     error: Optional[str]
+    observability_trace_id: str
 
 
 def _debug_dump(title: str, payload: Any, debug: bool) -> None:
@@ -452,7 +455,58 @@ def _contains_actionable_language(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_stock_bundle(target_code: str) -> dict[str, Any]:
+def _tool_name(tool: Any) -> str:
+    return getattr(tool, "name", tool.__class__.__name__)
+
+
+def _invoke_tool_observed(
+    tool: Any,
+    payload: dict[str, Any],
+    *,
+    target_code: str,
+    target_type: str,
+    trace_id: str | None = None,
+) -> Any:
+    """Invoke a LangChain tool and log duration without logging the payload."""
+    name = _tool_name(tool)
+    started_at = time.perf_counter()
+    log_agent_event(
+        "diagnosis.tool.start",
+        level=logging.DEBUG,
+        target_code=target_code,
+        target_type=target_type,
+        trace_id=trace_id,
+        tool=name,
+    )
+    try:
+        result = tool.invoke(payload)
+    except Exception as exc:
+        log_agent_event(
+            "diagnosis.tool.error",
+            level=logging.WARNING,
+            target_code=target_code,
+            target_type=target_type,
+            trace_id=trace_id,
+            tool=name,
+            duration_ms=elapsed_ms(started_at),
+            error=str(exc),
+        )
+        raise
+
+    log_agent_event(
+        "diagnosis.tool.done",
+        target_code=target_code,
+        target_type=target_type,
+        trace_id=trace_id,
+        tool=name,
+        duration_ms=elapsed_ms(started_at),
+        result_type=type(result).__name__,
+        result_size=payload_size(result),
+    )
+    return result
+
+
+def _fetch_stock_bundle(target_code: str, trace_id: str | None = None) -> dict[str, Any]:
     """Fetch the full stock data bundle through the tool layer.
 
     Pulls realtime quote, detailed financials, 120-day kline + technical
@@ -460,14 +514,24 @@ def _fetch_stock_bundle(target_code: str) -> dict[str, Any]:
     capital flow / analyst views. All five are gathered here so the analysis
     node receives one consolidated context.
     """
-    realtime = stock_realtime_tool.invoke({"code": target_code})
-    financial_detail = stock_financial_detail_tool.invoke({"code": target_code})
-    kline = stock_history_kline_tool.invoke({"code": target_code})
-    industry = stock_industry_tool.invoke({"code": target_code})
+    realtime = _invoke_tool_observed(
+        stock_realtime_tool, {"code": target_code}, target_code=target_code, target_type="stock", trace_id=trace_id
+    )
+    financial_detail = _invoke_tool_observed(
+        stock_financial_detail_tool, {"code": target_code}, target_code=target_code, target_type="stock", trace_id=trace_id
+    )
+    kline = _invoke_tool_observed(
+        stock_history_kline_tool, {"code": target_code}, target_code=target_code, target_type="stock", trace_id=trace_id
+    )
+    industry = _invoke_tool_observed(
+        stock_industry_tool, {"code": target_code}, target_code=target_code, target_type="stock", trace_id=trace_id
+    )
 
     stock_name = realtime.get("name") or target_code
     web_query = f"{stock_name} {target_code} 最新消息 资金流向 机构评级 风险事件"
-    web_search = web_search_tool.invoke({"query": web_query})
+    web_search = _invoke_tool_observed(
+        web_search_tool, {"query": web_query}, target_code=target_code, target_type="stock", trace_id=trace_id
+    )
 
     return {
         "realtime_data": realtime,
@@ -478,7 +542,7 @@ def _fetch_stock_bundle(target_code: str) -> dict[str, Any]:
     }
 
 
-def _fetch_fund_bundle(target_code: str) -> dict[str, Any]:
+def _fetch_fund_bundle(target_code: str, trace_id: str | None = None) -> dict[str, Any]:
     """Fetch fund basic info, NAV, performance, holdings, fee, industry, and web search.
 
     每个数据源独立 try/except，单个工具失败（如债基无持仓、QDII 无 A 股实时）
@@ -488,7 +552,9 @@ def _fetch_fund_bundle(target_code: str) -> dict[str, Any]:
 
     def _safe_invoke(tool, key: str) -> None:
         try:
-            bundle[key] = tool.invoke({"code": target_code})
+            bundle[key] = _invoke_tool_observed(
+                tool, {"code": target_code}, target_code=target_code, target_type="fund", trace_id=trace_id
+            )
         except Exception as exc:
             logger.warning("基金工具 %s 调用失败: %s", tool.name, exc)
             bundle[key] = {}
@@ -504,7 +570,9 @@ def _fetch_fund_bundle(target_code: str) -> dict[str, Any]:
     fund_name = bundle.get("fund_basic_info", {}).get("name") or target_code
     web_query = f"{fund_name} {target_code} 基金 最新消息 规模变化 申赎 风险事件 机构评级"
     try:
-        bundle["web_search_data"] = web_search_tool.invoke({"query": web_query})
+        bundle["web_search_data"] = _invoke_tool_observed(
+            web_search_tool, {"query": web_query}, target_code=target_code, target_type="fund", trace_id=trace_id
+        )
     except Exception as exc:
         logger.warning("基金联网搜索失败: %s", exc)
         bundle["web_search_data"] = {}
@@ -532,6 +600,7 @@ def build_diagnosis_graph(debug: bool = False):
         _debug_dump("fetch_data_node input", state, debug)
         target_code = state.get("target_code", "").strip()
         target_type = state.get("target_type")
+        trace_id = state.get("observability_trace_id") or new_trace_id("diagnosis-graph")
 
         if not target_code:
             result = {"error": "target_code is empty"}
@@ -540,15 +609,16 @@ def build_diagnosis_graph(debug: bool = False):
 
         try:
             if target_type == "stock":
-                bundle = _fetch_stock_bundle(target_code)
+                bundle = _fetch_stock_bundle(target_code, trace_id)
             elif target_type == "fund":
-                bundle = _fetch_fund_bundle(target_code)
+                bundle = _fetch_fund_bundle(target_code, trace_id)
             else:
                 raise ValueError(f"Unsupported target_type: {target_type!r}")
 
             result = {
                 **bundle,
                 "error": None,
+                "observability_trace_id": trace_id,
                 "messages": [
                     HumanMessage(
                         content=(
@@ -561,6 +631,7 @@ def build_diagnosis_graph(debug: bool = False):
         except Exception as exc:
             result = {
                 "error": str(exc),
+                "observability_trace_id": trace_id,
                 "messages": [AIMessage(content=f"数据抓取失败: {exc}")],
             }
 
@@ -605,6 +676,7 @@ def build_diagnosis_graph(debug: bool = False):
                 "你只输出 JSON，不输出任何其他内容、不输出 markdown 代码块。"
             )
 
+        analysis_started_at = time.perf_counter()
         try:
             raw = llm.invoke(
                 [
@@ -636,7 +708,24 @@ def build_diagnosis_graph(debug: bool = False):
                 ],
                 "error": None,
             }
+            log_agent_event(
+                "diagnosis.llm.done",
+                trace_id=state.get("observability_trace_id"),
+                target_code=state.get("target_code"),
+                target_type=target_type,
+                duration_ms=elapsed_ms(analysis_started_at),
+                result_type=type(result).__name__,
+            )
         except Exception as exc:
+            log_agent_event(
+                "diagnosis.llm.error",
+                level=logging.ERROR,
+                trace_id=state.get("observability_trace_id"),
+                target_code=state.get("target_code"),
+                target_type=target_type,
+                duration_ms=elapsed_ms(analysis_started_at),
+                error=str(exc),
+            )
             update = {"error": f"analysis failed: {exc}"}
 
         _debug_dump("analyze_node output", update, debug)
