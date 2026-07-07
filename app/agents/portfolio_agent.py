@@ -28,7 +28,22 @@ from app.observability import elapsed_ms, log_agent_event, new_trace_id
 
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS = 60.0
+PORTFOLIO_ANALYSIS_MIN_TIMEOUT_SECONDS = 60.0
+PORTFOLIO_ANALYSIS_PER_HOLDING_SECONDS = 20.0
+PORTFOLIO_ANALYSIS_MAX_TIMEOUT_SECONDS = 180.0
+
+
+def _portfolio_analysis_timeout_seconds(holdings_count: int) -> float:
+    """Return a bounded total timeout that scales with portfolio size."""
+    if holdings_count <= 0:
+        return PORTFOLIO_ANALYSIS_MIN_TIMEOUT_SECONDS
+    return min(
+        PORTFOLIO_ANALYSIS_MAX_TIMEOUT_SECONDS,
+        max(
+            PORTFOLIO_ANALYSIS_MIN_TIMEOUT_SECONDS,
+            holdings_count * PORTFOLIO_ANALYSIS_PER_HOLDING_SECONDS,
+        ),
+    )
 
 
 class PortfolioHoldingInput(TypedDict, total=False):
@@ -266,11 +281,13 @@ def build_portfolio_graph(debug: bool = False):
         # 单条持仓诊断涉及数据抓取（akshare/baostock/ddgs）与 LLM 调用，都是 IO 密集。
         # baostock 使用全局会话，并发过高容易出现连接/文件描述符异常；worker 数保守封顶 2。
         max_workers = min(len(holdings), 2)
+        timeout_seconds = _portfolio_analysis_timeout_seconds(len(holdings))
         log_agent_event(
             "portfolio.holdings.start",
             trace_id=trace_id,
             holdings_count=len(holdings),
             max_workers=max_workers,
+            timeout_seconds=timeout_seconds,
         )
         ordered: list[dict[str, Any] | None] = [None] * len(holdings)
         pool = ThreadPoolExecutor(max_workers=max_workers)
@@ -279,7 +296,7 @@ def build_portfolio_graph(debug: bool = False):
         }
         timed_out = False
         try:
-            for future in as_completed(future_to_idx, timeout=PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS):
+            for future in as_completed(future_to_idx, timeout=timeout_seconds):
                 idx = future_to_idx[future]
                 try:
                     ordered[idx] = future.result()
@@ -308,7 +325,7 @@ def build_portfolio_graph(debug: bool = False):
                 level=logging.WARNING,
                 trace_id=trace_id,
                 holdings_count=len(holdings),
-                timeout_seconds=PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS,
+                timeout_seconds=timeout_seconds,
                 duration_ms=elapsed_ms(node_started_at),
             )
         finally:
