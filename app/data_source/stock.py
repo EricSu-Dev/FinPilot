@@ -45,6 +45,7 @@ _bs_logged_in = False       # 是否已完成登录探测
 _bs_available = False       # baostock 当前是否可用（移动网络下常连不上）
 _bs_probe_started = False   # 后台探测线程是否已启动
 _bs_login_lock = threading.Lock()
+_bs_query_lock = threading.Lock()
 
 
 def _probe_bs_login() -> None:
@@ -85,8 +86,9 @@ def _safe_bs_logout() -> None:
     if not _bs_logged_in:
         return
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            bs.logout()
+        with _bs_query_lock:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                bs.logout()
     except Exception:
         pass
 
@@ -121,18 +123,19 @@ def _run_bs_query(query_fn: Callable[..., Any], *args: Any, **kwargs: Any) -> An
     """
     if not _ensure_bs_login():
         raise RuntimeError("baostock 不可用，应回退 akshare")
-    try:
-        rs = query_fn(*args, **kwargs)
-    except IndexError as exc:
-        raise RuntimeError("baostock 查询内部 IndexError，应回退 akshare") from exc
-    if getattr(rs, "error_code", "0") != "0":
-        _bs_relogin()
-        if not _bs_available:
-            raise RuntimeError("baostock 重连失败，应回退 akshare")
+    with _bs_query_lock:
         try:
             rs = query_fn(*args, **kwargs)
         except IndexError as exc:
-            raise RuntimeError("baostock 重试查询内部 IndexError，应回退 akshare") from exc
+            raise RuntimeError("baostock 查询内部 IndexError，应回退 akshare") from exc
+        if getattr(rs, "error_code", "0") != "0":
+            _bs_relogin()
+            if not _bs_available:
+                raise RuntimeError("baostock 重连失败，应回退 akshare")
+            try:
+                rs = query_fn(*args, **kwargs)
+            except IndexError as exc:
+                raise RuntimeError("baostock 重试查询内部 IndexError，应回退 akshare") from exc
     return rs
 
 

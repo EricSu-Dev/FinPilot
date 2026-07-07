@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from statistics import mean
 from typing import Annotated, Any, Literal, Optional, TypedDict
 
@@ -27,6 +27,8 @@ from app.agents.diagnosis_agent import (
 from app.observability import elapsed_ms, log_agent_event, new_trace_id
 
 logger = logging.getLogger(__name__)
+
+PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS = 60.0
 
 
 class PortfolioHoldingInput(TypedDict, total=False):
@@ -261,22 +263,23 @@ def build_portfolio_graph(debug: bool = False):
             )
             return {"holding_reports": [], "error": None, "observability_trace_id": trace_id}
 
-        # 单条持仓诊断涉及数据抓取（akshare/baostock/ddgs）与 LLM 调用，都是 IO 密集，
-        # 线程并发合适。worker 数封顶 5，避免持仓很多时一次性打出太多并发请求把
-        # 数据源或 DeepSeek 限流打爆（DeepSeek/akshare 都有 QPS 限制）。
-        max_workers = min(len(holdings), 5)
+        # 单条持仓诊断涉及数据抓取（akshare/baostock/ddgs）与 LLM 调用，都是 IO 密集。
+        # baostock 使用全局会话，并发过高容易出现连接/文件描述符异常；worker 数保守封顶 2。
+        max_workers = min(len(holdings), 2)
         log_agent_event(
             "portfolio.holdings.start",
             trace_id=trace_id,
             holdings_count=len(holdings),
             max_workers=max_workers,
         )
-        ordered: list[dict[str, Any]] = [None] * len(holdings)  # type: ignore[list-item]
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_idx = {
-                pool.submit(diagnose_one, h, trace_id, i): i for i, h in enumerate(holdings)
-            }
-            for future in as_completed(future_to_idx):
+        ordered: list[dict[str, Any] | None] = [None] * len(holdings)
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        future_to_idx = {
+            pool.submit(diagnose_one, h, trace_id, i): i for i, h in enumerate(holdings)
+        }
+        timed_out = False
+        try:
+            for future in as_completed(future_to_idx, timeout=PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS):
                 idx = future_to_idx[future]
                 try:
                     ordered[idx] = future.result()
@@ -298,10 +301,44 @@ def build_portfolio_graph(debug: bool = False):
                         "summary": f"诊断失败：{exc}",
                         "risk_level": "高",
                     }
+        except TimeoutError:
+            timed_out = True
+            log_agent_event(
+                "portfolio.holdings.timeout",
+                level=logging.WARNING,
+                trace_id=trace_id,
+                holdings_count=len(holdings),
+                timeout_seconds=PORTFOLIO_ANALYSIS_TIMEOUT_SECONDS,
+                duration_ms=elapsed_ms(node_started_at),
+            )
+        finally:
+            for future in future_to_idx:
+                if not future.done():
+                    future.cancel()
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
+
+        for idx, report in enumerate(ordered):
+            if report is not None:
+                continue
+            holding = holdings[idx]
+            ordered[idx] = {
+                "code": holding.get("code", ""),
+                "name": holding.get("name", ""),
+                "type": holding.get("type", "stock"),
+                "summary": (
+                    "数据源响应超时，已停止等待该持仓的深度诊断。"
+                    "可能是 baostock/akshare 行情源连接异常或外部接口限流，请稍后重试。"
+                ),
+                "risk_level": "高",
+            }
         log_agent_event(
             "portfolio.holdings.done",
             trace_id=trace_id,
             holdings_count=len(holdings),
+            timed_out=timed_out,
             duration_ms=elapsed_ms(node_started_at),
         )
         return {"holding_reports": ordered, "error": None, "observability_trace_id": trace_id}
@@ -328,6 +365,11 @@ def build_portfolio_graph(debug: bool = False):
             f"组合共包含 {len(holding_models)} 个标的，整体风险评级为 {risk_level}，"
             f"主要集中情况如下：{concentration_analysis}"
         )
+        timeout_count = sum(
+            1 for report in holding_reports if "数据源响应超时" in str(report.get("summary", ""))
+        )
+        if timeout_count:
+            summary += f" 其中 {timeout_count} 个持仓因外部行情源响应超时，已停止等待并按高风险数据缺口处理。"
         report = PortfolioReport(
             summary=summary,
             concentration_analysis=concentration_analysis,
